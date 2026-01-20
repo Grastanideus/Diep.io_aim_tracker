@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "Diep.io Texture Tracker",
+  "version": "1.0",
+  "permissions": [
+    "scripting"
+  ],
+  "host_permissions": [
+    "*://diep.io/*"
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["tracker.js"],
+      "matches": ["*://diep.io/*"]
+    }
+  ],
+  "content_scripts": [
+    {
+      "matches": ["*://diep.io/*"],
+      "js": ["loader.js"],
+      "run_at": "document_start"
+    }
+  ]
+}
