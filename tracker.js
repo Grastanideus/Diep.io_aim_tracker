@@ -1,24 +1,26 @@
-console.log('[DiepTracker] v8: Linear Regression & High Stability');
+console.log('[DiepTracker] v9: Optical Flow Locking & Quality Filter');
 
 const CONFIG = {
     // СКАНИРОВАНИЕ
-    scanStep: 8,           // Шаг сетки 
-    refineRadius: 15,      // Радиус уточнения
+    scanStep: 8,
+    refineRadius: 15,
     
     // ФИЛЬТРЫ
     ignoreMinimap: 200,
-    ignoreCenter: 65,      // Чуть больше радиус, чтобы точно не цеплять пушки
-    
-    // ЦВЕТА
+    ignoreCenter: 65,
     tolerance: 15,
     
-    // ФИЗИКА (ЛИНЕЙНАЯ РЕГРЕССИЯ)
-    fitLength: 10,         // Сколько последних точек брать для расчета вектора (Больше = стабильнее)
-    minPointsForFix: 4,    // Минимум точек, чтобы начать рисовать прогноз
+    // СТАБИЛИЗАЦИЯ (Оптический поток)
+    lockRange: 30,         // Искать сдвиг фона в пределах +/- 30 пикселей
+    
+    // АНАЛИЗ ТРАЕКТОРИИ
+    historyLen: 20,        // Длина памяти для расчета угла (чем больше, тем стабильнее)
+    minLinearity: 0.95,    // 1.0 = идеальная прямая. Если ниже 0.95 - не рисуем пунктир (фильтр "пьяных" пуль)
+    minSpeed: 2.0,
     
     // ВИЗУАЛ
-    predictionLen: 700,    // Длинный луч
-    lineWidth: 1.5         // Тонкие линии
+    predictionLen: 800,
+    lineWidth: 2
 };
 
 const TARGETS = {
@@ -30,7 +32,10 @@ const TARGETS = {
 
 let trajectories = [];
 let nextId = 1;
-let gridState = { lastX: 0, lastY: 0, valid: false };
+
+// Для оптического потока храним предыдущие строки пикселей
+let prevRow = null; // Horizontal strip
+let prevCol = null; // Vertical strip
 
 function initTracker() {
     const canvas = document.getElementById('canvas'); 
@@ -53,241 +58,225 @@ function processFrame(canvas, ctx) {
     const imgData = ctx.getImageData(0, 0, w, h);
     const data = imgData.data;
 
-    // 1. КОРРЕКЦИЯ СЕТКИ (Улучшенная)
-    const gridMove = getGridShift(data, w, h);
-    if (gridMove.shifted) {
+    // --- 1. ОПТИЧЕСКИЙ ПОТОК (СУПЕР ТОЧНЫЙ СДВИГ ФОНА) ---
+    // Берем крестовину пикселей через центр экрана
+    const midX = (w/2)|0;
+    const midY = (h/2)|0;
+    // Длина полосы анализа (достаточно 200px в центре)
+    const scanLen = 300; 
+    
+    // Извлекаем текущие полосы яркости (Luma)
+    const currRow = new Uint8Array(scanLen);
+    const currCol = new Uint8Array(scanLen);
+    
+    // Заполняем X полосу
+    let ptr = 0;
+    for (let x = midX - scanLen/2; x < midX + scanLen/2; x++) {
+        const i = (midY * w + x) * 4;
+        currRow[ptr++] = data[i]; // Берем только Red канал, для скорости (в ч/б сетке этого достаточно)
+    }
+    
+    // Заполняем Y полосу
+    ptr = 0;
+    for (let y = midY - scanLen/2; y < midY + scanLen/2; y++) {
+        const i = (y * w + midX) * 4;
+        currCol[ptr++] = data[i];
+    }
+
+    // Считаем сдвиг относительно прошлого кадра
+    const shift = calculateOpticalShift(currRow, currCol, prevRow, prevCol, scanLen);
+    
+    // Сохраняем текущие полосы как "прошлые" для следующего кадра
+    prevRow = currRow;
+    prevCol = currCol;
+
+    // Применяем сдвиг к траекториям (ОБРАТНАЯ КОМПЕНСАЦИЯ)
+    if (shift.valid) {
         for (let t of trajectories) {
-            // Сдвигаем все точки истории
+            t.x -= shift.dx;
+            t.y -= shift.dy;
             for (let p of t.points) {
-                p.x -= gridMove.dx;
-                p.y -= gridMove.dy;
+                p.x -= shift.dx;
+                p.y -= shift.dy;
             }
-            // Сдвигаем текущую сглаженную позицию
-            t.x -= gridMove.dx;
-            t.y -= gridMove.dy;
         }
     }
 
-    // 2. ПОИСК (Как и раньше, но чуть строже)
+    // --- 2. ПОИСК ОБЪЕКТОВ ---
     const balls = findBalls(data, w, h);
 
-    // 3. ОБНОВЛЕНИЕ ТРАЕКТОРИЙ
+    // --- 3. ТРЕКИНГ ---
     updateTrajectories(balls);
 
-    // 4. РАСЧЕТ ВЕКТОРОВ (РЕГРЕССИЯ) И ОТРИСОВКА
+    // --- 4. ОТРИСОВКА ---
     drawOverlay(ctx);
+}
+
+// Алгоритм сопоставления шаблонов (Template Matching) 1D
+function calculateOpticalShift(row, col, oldRow, oldCol, len) {
+    if (!oldRow || !oldCol) return { dx: 0, dy: 0, valid: false };
+
+    const searchRange = CONFIG.lockRange;
+    
+    // Поиск смещения по X
+    let bestDx = 0;
+    let minErrX = Infinity;
+    
+    // Пробуем сдвигать старый массив от -Range до +Range и ищем совпадение
+    for (let offset = -searchRange; offset <= searchRange; offset++) {
+        let err = 0;
+        // Сравниваем центр массива (чтобы не вылететь за границы при сдвиге)
+        // Сравниваем область 100 пикселей
+        for (let i = 50; i < len - 50; i++) {
+            const diff = row[i] - oldRow[i - offset];
+            err += Math.abs(diff);
+        }
+        if (err < minErrX) { minErrX = err; bestDx = offset; }
+    }
+
+    // Поиск смещения по Y
+    let bestDy = 0;
+    let minErrY = Infinity;
+    
+    for (let offset = -searchRange; offset <= searchRange; offset++) {
+        let err = 0;
+        for (let i = 50; i < len - 50; i++) {
+            const diff = col[i] - oldCol[i - offset];
+            err += Math.abs(diff);
+        }
+        if (err < minErrY) { minErrY = err; bestDy = offset; }
+    }
+
+    // Если ошибка слишком велика, значит фон изменился полностью (смена сцены?), игнорируем
+    // Но для дип.ио фон однородный, так что это редкость.
+    return { dx: bestDx, dy: bestDy, valid: true };
 }
 
 function findBalls(data, w, h) {
     const balls = [];
     const step = CONFIG.scanStep;
-    const cx = w / 2, cy = h / 2;
-    const centerRadSq = CONFIG.ignoreCenter ** 2;
-    const mapMinX = w - CONFIG.ignoreMinimap;
-    const mapMinY = h - CONFIG.ignoreMinimap;
-
-    // Сетка занятости (оптимизация 1D массива)
+    const cx = w/2, cy = h/2;
+    const cRadSq = CONFIG.ignoreCenter**2;
+    const mapMinX = w - CONFIG.ignoreMinimap, mapMinY = h - CONFIG.ignoreMinimap;
     const gridSize = 40; 
-    const gridW = Math.ceil(w / gridSize);
-    const gridH = Math.ceil(h / gridSize);
-    const grid = new Uint8Array(gridW * gridH);
+    const gridW = Math.ceil(w/gridSize), gridH = Math.ceil(h/gridSize);
+    const grid = new Uint8Array(gridW*gridH);
 
-    for (let y = 0; y < h; y += step) {
-        // Оптимизация: пропуск миникарты
-        if (y > mapMinY) {
-             // Если мы в зоне Y миникарты, сканируем только левую часть экрана
-             for (let x = 0; x < mapMinX; x += step) {
-                 checkPixel(x, y);
-             }
-        } else {
-             // Иначе сканируем всю ширину
-             for (let x = 0; x < w; x += step) {
-                 checkPixel(x, y);
-             }
-        }
+    for (let y=0; y<h; y+=step) {
+        if(y>mapMinY) { for(let x=0; x<mapMinX; x+=step) check(x,y); }
+        else { for(let x=0; x<w; x+=step) check(x,y); }
     }
 
-    function checkPixel(x, y) {
-        // Игнор центра
-        const dx = x - cx, dy = y - cy;
-        if (dx*dx + dy*dy < centerRadSq) return;
+    function check(x, y) {
+        if ((x-cx)**2 + (y-cy)**2 < cRadSq) return;
+        const gx = (x/gridSize)|0, gy = (y/gridSize)|0;
+        if (grid[gy*gridW+gx]) return;
 
-        // Проверка сетки занятости
-        const gx = (x / gridSize) | 0;
-        const gy = (y / gridSize) | 0;
-        if (grid[gy * gridW + gx]) return;
+        const idx = (y*w+x)*4;
+        if (Math.abs(data[idx]-data[idx+1]) < 20 && Math.abs(data[idx+1]-data[idx+2]) < 20) return;
 
-        const idx = (y * w + x) * 4;
-        // Префильтр (серый фон)
-        if (Math.abs(data[idx] - data[idx+1]) < 20 && Math.abs(data[idx+1] - data[idx+2]) < 20) return;
-
-        // Поиск цвета
         let match = null;
         const r = data[idx], g = data[idx+1], b = data[idx+2];
-        for (const [key, t] of Object.entries(TARGETS)) {
-            if (Math.abs(r - t.r) + Math.abs(g - t.g) + Math.abs(b - t.b) < CONFIG.tolerance * 3) {
-                match = key; break;
-            }
+        for (const k in TARGETS) {
+            const t = TARGETS[k];
+            if (Math.abs(r-t.r)+Math.abs(g-t.g)+Math.abs(b-t.b) < CONFIG.tolerance*3) { match = k; break; }
         }
 
         if (match) {
-            const center = refineCenter(data, w, h, x, y, match);
-            balls.push({ x: center.x, y: center.y, color: match });
-            
-            // Помечаем сетку
-            const cgx = (center.x / gridSize) | 0;
-            const cgy = (center.y / gridSize) | 0;
-            // Помечаем 3x3 клетки вокруг, чтобы не детектить этот же шар
-            for(let ly = cgy-1; ly <= cgy+1; ly++) {
-                for(let lx = cgx-1; lx <= cgx+1; lx++) {
-                    if(lx >=0 && lx < gridW && ly >=0 && ly < gridH) grid[ly * gridW + lx] = 1;
-                }
-            }
+            const c = refineCenter(data, w, h, x, y, match);
+            balls.push({x: c.x, y: c.y, color: match});
+            for(let ly=gy-1; ly<=gy+1; ly++) 
+                for(let lx=gx-1; lx<=gx+1; lx++) 
+                    if(lx>=0 && lx<gridW && ly>=0 && ly<gridH) grid[ly*gridW+lx]=1;
         }
     }
     return balls;
 }
 
 function refineCenter(data, w, h, startX, startY, colorKey) {
-    let sumX = 0, sumY = 0, count = 0;
-    const target = TARGETS[colorKey];
-    const rLim = CONFIG.refineRadius;
-    
-    for (let y = startY - rLim; y <= startY + rLim; y += 2) {
-        if (y < 0 || y >= h) continue;
-        for (let x = startX - rLim; x <= startX + rLim; x += 2) {
-            if (x < 0 || x >= w) continue;
-            const i = (y * w + x) * 4;
-            const dist = Math.abs(data[i] - target.r) + Math.abs(data[i+1] - target.g) + Math.abs(data[i+2] - target.b);
-            if (dist < CONFIG.tolerance * 3) {
-                sumX += x; sumY += y; count++;
+    let sx=0, sy=0, c=0;
+    const t = TARGETS[colorKey], lim = CONFIG.refineRadius;
+    for(let y=startY-lim; y<=startY+lim; y+=2) {
+        if(y<0||y>=h) continue;
+        for(let x=startX-lim; x<=startX+lim; x+=2) {
+            if(x<0||x>=w) continue;
+            const i=(y*w+x)*4;
+            if(Math.abs(data[i]-t.r)+Math.abs(data[i+1]-t.g)+Math.abs(data[i+2]-t.b) < CONFIG.tolerance*3) {
+                sx+=x; sy+=y; c++;
             }
         }
     }
-    return count > 0 ? { x: sumX/count, y: sumY/count } : { x: startX, y: startY };
+    return c>0 ? {x: sx/c, y: sy/c} : {x: startX, y: startY};
 }
 
 function updateTrajectories(balls) {
-    // 1. Предиктивный апдейт
     for (let t of trajectories) {
         t.updated = false;
-        
-        // Используем последний известный вектор для предсказания зоны поиска
-        let searchX = t.x + (t.lastVx || 0);
-        let searchY = t.y + (t.lastVy || 0);
-        
-        let bestIdx = -1; 
-        let bestDist = 60; // Радиус поиска
-
-        for (let i = 0; i < balls.length; i++) {
-            if (balls[i].color !== t.color) continue;
-            const dist = Math.hypot(balls[i].x - searchX, balls[i].y - searchY);
-            if (dist < bestDist) { bestDist = dist; bestIdx = i; }
+        // Простой линейный предикт для ассоциации
+        let predX = t.x, predY = t.y;
+        if(t.points.length > 1) {
+            predX += (t.points[t.points.length-1].x - t.points[t.points.length-2].x);
+            predY += (t.points[t.points.length-1].y - t.points[t.points.length-2].y);
         }
 
-        if (bestIdx !== -1) {
-            const obj = balls[bestIdx];
-            t.x = obj.x; 
-            t.y = obj.y;
-            t.points.push({ x: obj.x, y: obj.y, time: Date.now() });
-            
-            // Ограничиваем историю точек для регрессии
-            if (t.points.length > 20) t.points.shift();
-            
+        let bestIdx = -1, bestDist = 60;
+        for(let i=0; i<balls.length; i++) {
+            if(balls[i].color !== t.color) continue;
+            const dist = Math.hypot(balls[i].x - predX, balls[i].y - predY);
+            if(dist < bestDist) { bestDist = dist; bestIdx = i; }
+        }
+
+        if(bestIdx !== -1) {
+            const b = balls[bestIdx];
+            t.x = b.x; t.y = b.y;
+            t.points.push({x: b.x, y: b.y});
+            if(t.points.length > CONFIG.historyLen) t.points.shift();
             t.updated = true;
             balls.splice(bestIdx, 1);
         }
     }
-
-    // 2. Новые
-    for (let b of balls) {
+    for(let b of balls) {
         trajectories.push({
-            id: nextId++,
-            color: b.color,
-            x: b.x, y: b.y,
-            lastVx: 0, lastVy: 0,
-            points: [{ x: b.x, y: b.y, time: Date.now() }],
-            updated: true
+            id: nextId++, color: b.color, x: b.x, y: b.y,
+            points: [{x: b.x, y: b.y}], updated: true
         });
     }
-    
-    // 3. Удаление мертвых
     trajectories = trajectories.filter(t => t.updated);
 }
 
-// --- ЛИНЕЙНАЯ РЕГРЕССИЯ (СУТЬ v8) ---
-// Находит лучший вектор движения по облаку точек
-function calculateTrend(points) {
-    const len = points.length;
-    if (len < CONFIG.minPointsForFix) return null;
-
-    // Берем последние N точек
-    const subset = points.slice(-CONFIG.fitLength);
-    const n = subset.length;
+// Расчет регрессии и качества линии (R-squared approximation)
+function getTrend(points) {
+    if(points.length < 5) return null;
+    const n = points.length;
+    let sumX=0, sumY=0, sumT=0, sumT2=0, sumTX=0, sumTY=0;
     
-    // Регрессия: x = at + b (позиция от времени, где a = скорость)
-    // Но для простоты в игре с фиксированным FPS, мы можем считать индекс как время.
-    // x = velocity_x * index + start_x
-    
-    let sumT = 0, sumX = 0, sumY = 0;
-    let sumTX = 0, sumTY = 0, sumT2 = 0;
-
-    for (let i = 0; i < n; i++) {
-        // T - это просто порядковый номер, 0, 1, 2...
-        // Это делает расчет независимым от скачков лага браузера
-        const t = i; 
-        const p = subset[i];
-        
-        sumT += t;
-        sumT2 += t * t;
-        sumX += p.x;
-        sumY += p.y;
-        sumTX += t * p.x;
-        sumTY += t * p.y;
-    }
-
-    const den = (n * sumT2 - sumT * sumT);
-    if (den === 0) return null;
-
-    const vx = (n * sumTX - sumT * sumX) / den;
-    const vy = (n * sumTY - sumT * sumY) / den;
-
-    return { vx, vy };
-}
-
-function getGridShift(data, w, h) {
-    const midY = (h/2)|0; const midX = (w/2)|0;
-    // Увеличенный радиус поиска сетки
-    const range = 150; 
-    
-    let bestX = -1, minLum = 255;
-    const rowOffset = midY * w * 4;
-    for (let x = midX - range; x < midX + range; x++) {
-        const i = rowOffset + x * 4;
-        const lum = data[i]; // Можно брать только красный канал для скорости, он в сером такой же
-        if (lum < 205 && lum < minLum) { minLum = lum; bestX = x; }
+    for(let i=0; i<n; i++) {
+        sumX += points[i].x; sumY += points[i].y;
+        sumT += i; sumT2 += i*i;
+        sumTX += i*points[i].x; sumTY += i*points[i].y;
     }
     
-    let bestY = -1; minLum = 255;
-    for (let y = midY - range; y < midY + range; y++) {
-        const i = (y * w + midX) * 4;
-        const lum = data[i];
-        if (lum < 205 && lum < minLum) { minLum = lum; bestY = y; }
+    const den = n*sumT2 - sumT*sumT;
+    if(den === 0) return null;
+    
+    const vx = (n*sumTX - sumT*sumX) / den;
+    const vy = (n*sumTY - sumT*sumY) / den;
+    
+    // Проверка качества (ошибка)
+    let error = 0;
+    const startX = (sumX - vx*sumT)/n;
+    const startY = (sumY - vy*sumT)/n;
+    
+    for(let i=0; i<n; i++) {
+        const idealX = startX + vx*i;
+        const idealY = startY + vy*i;
+        const dx = points[i].x - idealX;
+        const dy = points[i].y - idealY;
+        error += Math.sqrt(dx*dx + dy*dy);
     }
+    const avgError = error / n;
 
-    let res = { shifted: false, dx: 0, dy: 0 };
-    if (bestX !== -1 && bestY !== -1) {
-        if (gridState.valid) {
-            const dx = bestX - gridState.lastX;
-            const dy = bestY - gridState.lastY;
-            // Увеличил лимит прыжка до 40, чтобы не терять сетку при быстром стрейфе
-            if (Math.abs(dx) < 40 && Math.abs(dy) < 40 && (dx !== 0 || dy !== 0)) {
-                res.dx = dx; res.dy = dy; res.shifted = true;
-            }
-        }
-        gridState.lastX = bestX; gridState.lastY = bestY; gridState.valid = true;
-    }
-    return res;
+    return { vx, vy, error: avgError };
 }
 
 function drawOverlay(ctx) {
@@ -295,47 +284,37 @@ function drawOverlay(ctx) {
     ctx.lineWidth = CONFIG.lineWidth;
     
     for (let t of trajectories) {
-        if (t.points.length < 2) continue;
+        if (t.points.length < 3) continue;
         const color = TARGETS[t.color].hex;
-        ctx.strokeStyle = color;
-        ctx.fillStyle = color;
-
-        // Рисуем хвост (историю)
+        ctx.strokeStyle = color; 
+        
+        // Линия истории (сплошная)
         ctx.beginPath();
-        // Рисуем только последние точки, чтобы не захламлять
-        const startIdx = Math.max(0, t.points.length - 10);
-        ctx.moveTo(t.points[startIdx].x, t.points[startIdx].y);
-        for (let i = startIdx + 1; i < t.points.length; i++) {
-            ctx.lineTo(t.points[i].x, t.points[i].y);
-        }
+        const start = Math.max(0, t.points.length-10);
+        ctx.moveTo(t.points[start].x, t.points[start].y);
+        for(let i=start+1; i<t.points.length; i++) ctx.lineTo(t.points[i].x, t.points[i].y);
         ctx.stroke();
 
-        // Считаем умный вектор
-        const trend = calculateTrend(t.points);
-        if (trend) {
+        // Анализ вектора
+        const trend = getTrend(t.points);
+        
+        // Рисуем пунктир ТОЛЬКО если ошибка линии мала (< 2.0 пикселей в среднем)
+        // Это уберет дергающиеся линии
+        if(trend && trend.error < 2.0) {
             const speed = Math.hypot(trend.vx, trend.vy);
-            t.lastVx = trend.vx; // Сохраняем для предикта
-            t.lastVy = trend.vy;
-
-            // Рисуем прогноз, только если объект реально летит
-            if (speed > 1.0) {
-                // Нормализация
-                const dirX = trend.vx / speed;
-                const dirY = trend.vy / speed;
+            if(speed > CONFIG.minSpeed) {
+                const head = t.points[t.points.length-1];
+                const dx = trend.vx / speed;
+                const dy = trend.vy / speed;
                 
-                const head = t.points[t.points.length - 1];
-                
-                // ЛУЧ НАЗАД (Источник)
                 ctx.beginPath();
-                ctx.setLineDash([10, 10]); // Редкий пунктир
-                ctx.globalAlpha = 0.6;
+                ctx.setLineDash([15, 10]); // Длинный штрих
+                ctx.globalAlpha = 0.5;
                 ctx.moveTo(head.x, head.y);
-                // Рисуем длинную прямую линию назад, ИГНОРИРУЯ мелкие колебания хвоста
-                ctx.lineTo(head.x - dirX * CONFIG.predictionLen, head.y - dirY * CONFIG.predictionLen);
+                ctx.lineTo(head.x - dx*CONFIG.predictionLen, head.y - dy*CONFIG.predictionLen);
                 ctx.stroke();
-                
-                ctx.setLineDash([]);
                 ctx.globalAlpha = 1.0;
+                ctx.setLineDash([]);
             }
         }
     }
